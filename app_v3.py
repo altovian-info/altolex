@@ -1,10 +1,10 @@
 """
-AltoLex — app_v4.py
+AltoLex — app_v3.py
 Custom authentication — users/roles in your own Supabase tables.
 No Supabase Auth. No auth.users dependency.
 Includes built-in admin panel for managing users and firms.
 
-Run: streamlit run app_v4.py
+Run: streamlit run app_v3.py
 """
 
 import streamlit as st
