@@ -1,43 +1,44 @@
-# AltoLex v3 — voyage-law-2 embeddings
+# AltoLex v4 — Custom authentication
 
-## What changed from v2
-
-| | v2 | v3 |
+## What changed from v3
+| | v3 | v4 |
 |---|---|---|
-| Embedding model | all-MiniLM-L6-v2 (local, free) | voyage-law-2 (API, legal-specialised) |
-| Vector dimensions | 384 | 1024 |
-| Embedding library | sentence-transformers | voyageai |
-| New env variable | — | VOYAGE_API_KEY |
-| input_type | not used | "document" at ingest, "query" at retrieval |
-| Legal retrieval accuracy | baseline | +6% over OpenAI on 8 legal datasets |
+| Auth system | Supabase Auth (auth.users) | Custom users table |
+| Login method | Supabase sign_in_with_password | bcrypt password verify |
+| Sessions | Supabase JWT | Random token in sessions table |
+| User management | Supabase Dashboard only | Built-in admin panel in app |
+| Env vars needed | 5 | 4 (removed ANON_KEY, JWT_SECRET) |
+| New files | — | auth.py |
 
-Files changed: ingest_v3.py, rag_v3.py, requirements.txt, supabase_setup_v3.sql
-Files unchanged: api_v3.py, app_v3.py
+## Setup — first time
 
-## Setup
+### 1. Database
+Run `supabase_setup_v4.sql` in Supabase SQL Editor.
 
-### 1. Get a Voyage API key
-Sign up at https://dash.voyageai.com → API Keys → Create key.
-Add to .env: VOYAGE_API_KEY=pa-...
+### 2. Create your first firm + admin user
+Uncomment the SEED block at the bottom of the SQL file.
+Edit the firm name and email, then run it.
 
-### 2. Database
-Fresh install: run supabase_setup_v3.sql (uses VECTOR(1024))
-Upgrading from v2: run the MIGRATION section at the bottom of the SQL file
+The default password is: changeme123
+The admin user MUST change this on first login via ⚙ Admin → edit user.
 
-### 3. Install dependencies
-pip install -r requirements.txt
+### 3. Deploy
+Add to Streamlit secrets:
+  ANTHROPIC_API_KEY
+  VOYAGE_API_KEY
+  SUPABASE_URL
+  SUPABASE_SERVICE_KEY
 
-### 4. Re-ingest all documents (required when upgrading from v2)
-Old 384-dim vectors are incompatible with 1024-dim. Must re-ingest everything.
-python ingest_v3.py --dir ./docs --firm-id <uuid>
+### 4. Add more users
+Log in as admin → ⚙ Admin → Add User tab.
+Set their name, email, role, and a temporary password.
+Share the password with them securely — they can change it in the Admin panel.
 
-### 5. Run
-streamlit run app_v3.py
-
-## Voyage API cost
-voyage-law-2 is billed per token:
-- ~$0.00012 per 1000 tokens at ingest
-- ~$0.00012 per 1000 tokens per query embedding
-- A 10-page contract (~3000 tokens) costs ~$0.00036 to ingest
-- Each user query costs ~$0.000012 (100 tokens) to embed
-- Effectively negligible vs Claude API costs
+## Roles
+| Role | Intake | Q&A | Document Review | Admin panel |
+|---|---|---|---|---|
+| admin | ✅ | ✅ | ✅ | ✅ |
+| partner | ✅ | ✅ | ✅ | ❌ |
+| associate | ✅ | ✅ | ✅ | ❌ |
+| paralegal | ✅ | ✅ | ✅ | ❌ |
+| readonly | ❌ | ✅ | view only | ❌ |

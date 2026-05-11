@@ -1,27 +1,13 @@
-# LexAssist requirements
-# Install: pip install -r requirements.txt
-
-# Core
+# AltoLex v4 requirements
 anthropic>=0.25.0
 streamlit>=1.32.0
-
-# PDF — text extraction
-PyPDF2>=3.0.0
-
-# PDF — scanned / OCR (converts pages to images for Claude vision)
-# Replaces the need for a separate OCR service like Tesseract or AWS Textract
-PyMuPDF>=1.23.0
-
-# Word documents (.docx)
-python-docx>=1.1.0
-
-# RAG pipeline (for future use)
 supabase>=2.3.0
 voyageai>=0.3.0
+bcrypt>=4.1.0
+PyPDF2>=3.0.0
+PyMuPDF>=1.23.0
+python-docx>=1.1.0
 python-dotenv>=1.0.0
-
-# API server (optional — for production deployment)
 fastapi>=0.110.0
 uvicorn>=0.29.0
 python-multipart>=0.0.9
-PyJWT>=2.8.0

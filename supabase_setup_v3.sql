@@ -1,33 +1,59 @@
 -- ============================================================
--- AltoLex — Supabase setup v2
--- Multi-tenant with Row Level Security (RLS)
+-- AltoLex — Supabase setup v4
+-- Custom authentication — no dependency on Supabase auth.users
+-- Users and roles managed entirely in your own tables.
 --
 -- Run in: Supabase Dashboard → SQL Editor → New Query → Run
--- New project: run the full file.
--- Upgrading from v1: run only the MIGRATION section at bottom.
 -- ============================================================
 
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- for gen_random_uuid()
 
--- ── 1. Firms (your tenants) ───────────────────────────────────────────────────
+-- ── 1. Firms ──────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS firms (
     id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name       TEXT NOT NULL,
     plan       TEXT NOT NULL DEFAULT 'starter',  -- starter | pro | enterprise
+    is_active  BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ── 2. Attorneys (extends Supabase auth.users) ────────────────────────────────
-CREATE TABLE IF NOT EXISTS attorneys (
-    id         UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-    firm_id    UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
-    full_name  TEXT,
-    role       TEXT NOT NULL DEFAULT 'associate',  -- partner | associate | paralegal | admin
-    created_at TIMESTAMPTZ DEFAULT NOW()
+-- ── 2. Users (replaces Supabase auth.users entirely) ─────────────────────────
+-- Passwords hashed with bcrypt in application layer (never stored plain).
+CREATE TABLE IF NOT EXISTS users (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    firm_id         UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    email           TEXT NOT NULL UNIQUE,
+    password_hash   TEXT NOT NULL,              -- bcrypt hash, set by app
+    full_name       TEXT NOT NULL,
+    role            TEXT NOT NULL DEFAULT 'associate',
+                                                -- admin | partner | associate | paralegal | readonly
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    last_login      TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    created_by      UUID REFERENCES users(id) ON DELETE SET NULL
 );
 
--- ── 3. Clients ────────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS users_email_idx   ON users(email);
+CREATE INDEX IF NOT EXISTS users_firm_idx    ON users(firm_id);
+
+-- ── 3. Sessions ───────────────────────────────────────────────────────────────
+-- Server-side session tokens stored here.
+-- Streamlit stores only the token string in session_state.
+CREATE TABLE IF NOT EXISTS sessions (
+    token       TEXT PRIMARY KEY,               -- random 64-char hex token
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    firm_id     UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    ip_address  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS sessions_user_idx    ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS sessions_expires_idx ON sessions(expires_at);
+
+-- ── 4. Clients ────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS clients (
     id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     firm_id    UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
@@ -37,109 +63,69 @@ CREATE TABLE IF NOT EXISTS clients (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ── 4. Cases ──────────────────────────────────────────────────────────────────
+-- ── 5. Cases ──────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS cases (
     id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     firm_id     UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
     client_id   UUID NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
     title       TEXT NOT NULL,
     area_of_law TEXT,
-    status      TEXT NOT NULL DEFAULT 'open',  -- open | closed | archived
+    status      TEXT NOT NULL DEFAULT 'open',
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ── 5. Documents (vector store) ───────────────────────────────────────────────
--- Every chunk carries firm_id + case_id. No row is ever accessible
--- to another firm — enforced at DB level, not app level.
+-- ── 6. Documents (vector store) ───────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS documents (
     id         BIGSERIAL PRIMARY KEY,
     firm_id    UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
-    case_id    UUID REFERENCES cases(id) ON DELETE CASCADE,  -- NULL = firm-wide knowledge base
+    case_id    UUID REFERENCES cases(id) ON DELETE CASCADE,
     content    TEXT NOT NULL,
-    embedding  VECTOR(1024),
+    embedding  VECTOR(1024),                    -- voyage-law-2 dimensions
     metadata   JSONB DEFAULT '{}',
     file_hash  TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ── 6. Conversations (audit trail) ────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS documents_embedding_idx
+    ON documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+CREATE INDEX IF NOT EXISTS documents_firm_idx  ON documents(firm_id);
+CREATE INDEX IF NOT EXISTS documents_case_idx  ON documents(case_id);
+
+-- ── 7. Conversations ──────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS conversations (
-    id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    firm_id      UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
-    case_id      UUID REFERENCES cases(id) ON DELETE SET NULL,
-    attorney_id  UUID REFERENCES attorneys(id) ON DELETE SET NULL,
-    question     TEXT NOT NULL,
-    answer       TEXT NOT NULL,
-    doc_sources  JSONB DEFAULT '[]',
-    created_at   TIMESTAMPTZ DEFAULT NOW()
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    firm_id     UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    case_id     UUID REFERENCES cases(id) ON DELETE SET NULL,
+    user_id     UUID REFERENCES users(id) ON DELETE SET NULL,
+    question    TEXT NOT NULL,
+    answer      TEXT NOT NULL,
+    doc_sources JSONB DEFAULT '[]',
+    created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ── 7. Audit log (immutable — append only) ────────────────────────────────────
+CREATE INDEX IF NOT EXISTS conversations_firm_idx ON conversations(firm_id);
+
+-- ── 8. Audit log ──────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS audit_log (
     id            BIGSERIAL PRIMARY KEY,
     firm_id       UUID NOT NULL,
-    attorney_id   UUID,
-    action        TEXT NOT NULL,   -- query | ingest | delete | login | logout
-    resource_type TEXT,            -- document | case | client
+    user_id       UUID,
+    action        TEXT NOT NULL,
+    resource_type TEXT,
     resource_id   TEXT,
     ip_address    TEXT,
     metadata      JSONB DEFAULT '{}',
     created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
-
--- ════════════════════════════════════════════════════════════
--- INDEXES
--- ════════════════════════════════════════════════════════════
-
-CREATE INDEX IF NOT EXISTS documents_embedding_idx
-    ON documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-
-CREATE INDEX IF NOT EXISTS documents_firm_idx      ON documents(firm_id);
-CREATE INDEX IF NOT EXISTS documents_case_idx      ON documents(case_id);
-CREATE INDEX IF NOT EXISTS conversations_firm_idx  ON conversations(firm_id);
-CREATE INDEX IF NOT EXISTS audit_log_firm_idx      ON audit_log(firm_id);
-CREATE INDEX IF NOT EXISTS audit_log_atty_idx      ON audit_log(attorney_id);
-CREATE INDEX IF NOT EXISTS audit_log_created_idx   ON audit_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS audit_log_firm_idx    ON audit_log(firm_id);
+CREATE INDEX IF NOT EXISTS audit_log_user_idx    ON audit_log(user_id);
+CREATE INDEX IF NOT EXISTS audit_log_created_idx ON audit_log(created_at DESC);
 
 
 -- ════════════════════════════════════════════════════════════
--- HELPER: resolve current attorney's firm from JWT
--- ════════════════════════════════════════════════════════════
-CREATE OR REPLACE FUNCTION current_firm_id()
-RETURNS UUID LANGUAGE sql STABLE AS $$
-    SELECT firm_id FROM attorneys WHERE id = auth.uid();
-$$;
-
-
--- ════════════════════════════════════════════════════════════
--- ROW LEVEL SECURITY
--- Every table is locked to the calling attorney's firm.
--- A misconfigured query physically cannot return another firm's data.
--- ════════════════════════════════════════════════════════════
-
-ALTER TABLE firms          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE attorneys      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE clients        ENABLE ROW LEVEL SECURITY;
-ALTER TABLE cases          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE documents      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE conversations  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE audit_log      ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "firms: own firm"         ON firms         FOR ALL USING (id = current_firm_id());
-CREATE POLICY "attorneys: same firm"    ON attorneys     FOR ALL USING (firm_id = current_firm_id());
-CREATE POLICY "clients: own firm"       ON clients       FOR ALL USING (firm_id = current_firm_id());
-CREATE POLICY "cases: own firm"         ON cases         FOR ALL USING (firm_id = current_firm_id());
-CREATE POLICY "documents: own firm"     ON documents     FOR ALL USING (firm_id = current_firm_id());
-CREATE POLICY "conversations: own firm" ON conversations FOR ALL USING (firm_id = current_firm_id());
-
--- Audit log: attorneys can READ their firm's log; only service-role key can write
-CREATE POLICY "audit_log: read own firm" ON audit_log
-    FOR SELECT USING (firm_id = current_firm_id());
-
-
--- ════════════════════════════════════════════════════════════
--- MATCH FUNCTION — tenant-scoped vector similarity search
+-- VECTOR SEARCH FUNCTION
+-- Now uses firm_id from your own users table, not auth.uid()
 -- ════════════════════════════════════════════════════════════
 CREATE OR REPLACE FUNCTION match_documents(
     query_embedding  VECTOR(1024),
@@ -154,7 +140,7 @@ RETURNS TABLE (
     metadata   JSONB,
     similarity FLOAT
 )
-LANGUAGE plpgsql SECURITY DEFINER AS $$
+LANGUAGE plpgsql AS $$
 BEGIN
     RETURN QUERY
     SELECT
@@ -164,14 +150,9 @@ BEGIN
         1 - (d.embedding <=> query_embedding) AS similarity
     FROM documents d
     WHERE
-        d.firm_id = p_firm_id                                   -- hard tenant fence
-        AND (
-            p_case_id IS NULL                                   -- no case filter: include all
-            OR d.case_id = p_case_id                            -- this case's documents
-            OR d.case_id IS NULL                                -- firm-wide knowledge base
-        )
-        AND (filter_doc_type IS NULL
-             OR d.metadata->>'doc_type' = filter_doc_type)
+        d.firm_id = p_firm_id
+        AND (p_case_id IS NULL OR d.case_id = p_case_id OR d.case_id IS NULL)
+        AND (filter_doc_type IS NULL OR d.metadata->>'doc_type' = filter_doc_type)
     ORDER BY d.embedding <=> query_embedding
     LIMIT match_count;
 END;
@@ -179,66 +160,42 @@ $$;
 
 
 -- ════════════════════════════════════════════════════════════
--- TRIGGER: auto-create attorney profile on Supabase Auth signup
--- The signup call must include raw_user_meta_data:
---   { "firm_id": "<uuid>", "full_name": "...", "role": "associate" }
+-- CLEANUP FUNCTION — expire old sessions (run via cron or manually)
 -- ════════════════════════════════════════════════════════════
-CREATE OR REPLACE FUNCTION handle_new_attorney()
-RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER AS $$
+CREATE OR REPLACE FUNCTION cleanup_expired_sessions()
+RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
-    INSERT INTO attorneys (id, firm_id, full_name, role)
-    VALUES (
-        NEW.id,
-        (NEW.raw_user_meta_data->>'firm_id')::UUID,
-        NEW.raw_user_meta_data->>'full_name',
-        COALESCE(NEW.raw_user_meta_data->>'role', 'associate')
-    );
-    RETURN NEW;
+    DELETE FROM sessions WHERE expires_at < NOW();
 END;
 $$;
 
-CREATE OR REPLACE TRIGGER on_auth_user_created
-    AFTER INSERT ON auth.users
-    FOR EACH ROW EXECUTE FUNCTION handle_new_attorney();
+
+-- ════════════════════════════════════════════════════════════
+-- SEED: create your first firm and admin user
+-- Replace values before running.
+-- Password below is bcrypt hash of "changeme123" — CHANGE IT on first login.
+-- Generate a new hash at: https://bcrypt.online (cost factor 12)
+-- ════════════════════════════════════════════════════════════
+
+-- INSERT INTO firms (id, name, plan)
+-- VALUES ('00000000-0000-0000-0000-000000000001', 'Altovian Law', 'pro');
+
+-- INSERT INTO users (firm_id, email, password_hash, full_name, role)
+-- VALUES (
+--     '00000000-0000-0000-0000-000000000001',
+--     'admin@yourfirm.com',
+--     '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj/VgYy6K3Hy',  -- "changeme123"
+--     'Admin User',
+--     'admin'
+-- );
 
 
 -- ════════════════════════════════════════════════════════════
--- MIGRATION FROM v1 (existing documents table without tenant cols)
--- Uncomment and run if upgrading — do NOT run on a fresh setup.
+-- MIGRATION FROM v3 (had attorneys table referencing auth.users)
 -- ════════════════════════════════════════════════════════════
-
--- Step 1: Create the firms/attorneys/clients/cases tables above first.
--- Step 2: Insert your firm row and get its UUID.
---   INSERT INTO firms (name) VALUES ('Your Firm Name') RETURNING id;
--- Step 3: Backfill the existing documents rows with that firm_id.
---   ALTER TABLE documents ADD COLUMN IF NOT EXISTS firm_id UUID REFERENCES firms(id);
---   ALTER TABLE documents ADD COLUMN IF NOT EXISTS case_id UUID REFERENCES cases(id);
---   UPDATE documents SET firm_id = '<paste-uuid-here>' WHERE firm_id IS NULL;
---   ALTER TABLE documents ALTER COLUMN firm_id SET NOT NULL;
--- Step 4: Enable RLS.
---   ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
---   CREATE POLICY "documents: own firm" ON documents FOR ALL USING (firm_id = current_firm_id());
--- Step 5: Replace the match_documents function with the new version above.
-
-
--- ════════════════════════════════════════════════════════════
--- MIGRATION FROM v2 (changing embedding dimension 384 → 1024)
--- Run if you already have data embedded with all-MiniLM-L6-v2.
--- WARNING: you MUST re-ingest all documents after this — old
--- 384-dim vectors are incompatible with 1024-dim voyage-law-2.
--- ════════════════════════════════════════════════════════════
--- Step 1: Drop the old index (cannot change dimension with index in place)
--- DROP INDEX IF EXISTS documents_embedding_idx;
-
--- Step 2: Change the column dimension
--- ALTER TABLE documents ALTER COLUMN embedding TYPE VECTOR(1024);
-
--- Step 3: Clear old embeddings (they are incompatible — must re-ingest)
--- DELETE FROM documents;
-
--- Step 4: Recreate the index
--- CREATE INDEX documents_embedding_idx
---     ON documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-
--- Step 5: Re-run ingest_v3.py for all your documents
---   python ingest_v3.py --dir ./docs --firm-id <uuid>
+-- 1. Run this file to create the new tables.
+-- 2. Add your firm via the SEED block above (uncomment and edit).
+-- 3. Use the AltoLex admin panel (⚙ Admin) to create all users.
+-- 4. Old attorneys table can be dropped: DROP TABLE IF EXISTS attorneys CASCADE;
+-- 5. Remove SUPABASE_ANON_KEY and SUPABASE_JWT_SECRET from your secrets —
+--    they are no longer needed. Keep SUPABASE_SERVICE_KEY for DB access.
