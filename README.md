@@ -1,44 +1,30 @@
-# AltoLex v4 — Custom authentication
+# AltoLex v4b — Scoped DB + RLS safety net
 
-## What changed from v3
-| | v3 | v4 |
+## What changed from v4
+
+| | v4 | v4b |
 |---|---|---|
-| Auth system | Supabase Auth (auth.users) | Custom users table |
-| Login method | Supabase sign_in_with_password | bcrypt password verify |
-| Sessions | Supabase JWT | Random token in sessions table |
-| User management | Supabase Dashboard only | Built-in admin panel in app |
-| Env vars needed | 5 | 4 (removed ANON_KEY, JWT_SECRET) |
-| New files | — | auth.py |
+| Tenant isolation | firm_id filters in queries | ScopedDB wrapper — structural enforcement |
+| Cross-tenant protection | Manual, forgettable | Impossible — ScopedDB raises PermissionError |
+| RLS | Disabled | Deny-all for non-service roles (backstop) |
+| auth.py queries | Mixed raw/scoped | All writes via ScopedDB |
+| rag_v3.py | Used SUPABASE_ANON_KEY (dead) | Removed, uses ScopedDB.rpc() |
+| New files | — | db.py |
 
-## Setup — first time
+## Security model (two layers)
 
-### 1. Database
-Run `supabase_setup_v4.sql` in Supabase SQL Editor.
+Layer 1 — ScopedDB (application):
+  Every query goes through ScopedDB(firm_id).
+  firm_id is injected automatically on SELECT/INSERT/UPDATE/DELETE.
+  RPC calls verify p_firm_id matches the scoped firm_id.
+  A bug that forgets to filter by firm_id is structurally prevented.
 
-### 2. Create your first firm + admin user
-Uncomment the SEED block at the bottom of the SQL file.
-Edit the firm name and email, then run it.
+Layer 2 — Postgres RLS (database):
+  Deny-all policies on all tenant tables for non-service roles.
+  Service role (used by app) bypasses RLS — controlled by Layer 1.
+  Anon/user key access is blocked at DB level.
+  Protects against accidental direct DB access or leaked anon key.
 
-The default password is: changeme123
-The admin user MUST change this on first login via ⚙ Admin → edit user.
-
-### 3. Deploy
-Add to Streamlit secrets:
-  ANTHROPIC_API_KEY
-  VOYAGE_API_KEY
-  SUPABASE_URL
-  SUPABASE_SERVICE_KEY
-
-### 4. Add more users
-Log in as admin → ⚙ Admin → Add User tab.
-Set their name, email, role, and a temporary password.
-Share the password with them securely — they can change it in the Admin panel.
-
-## Roles
-| Role | Intake | Q&A | Document Review | Admin panel |
-|---|---|---|---|---|
-| admin | ✅ | ✅ | ✅ | ✅ |
-| partner | ✅ | ✅ | ✅ | ❌ |
-| associate | ✅ | ✅ | ✅ | ❌ |
-| paralegal | ✅ | ✅ | ✅ | ❌ |
-| readonly | ❌ | ✅ | view only | ❌ |
+## Setup
+Same as v4. Run supabase_setup_v4.sql (includes RLS policies at bottom).
+Deploy app_v4.py — it imports from auth.py which imports from db.py.
