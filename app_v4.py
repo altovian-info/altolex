@@ -36,17 +36,71 @@ st.set_page_config(page_title="AltoLex", page_icon="⚖️", layout="wide")
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600&family=DM+Sans:wght@300;400;500&display=swap');
-html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+
+/* ── Font ── */
+html, body, [class*="css"], .stMarkdown, .stText,
+p, li, span, div { font-family: 'DM Sans', sans-serif; }
 h1, h2, h3 { font-family: 'Playfair Display', serif !important; }
-.stApp { background: #f7f4ef; }
-.badge { display:inline-block; padding:3px 10px; border-radius:20px; font-size:11px;
-         font-weight:600; letter-spacing:0.06em; text-transform:uppercase; margin-right:4px; }
-.badge-firm   { background:rgba(184,147,90,0.12); color:#b8935a; border:1px solid rgba(184,147,90,0.3); }
-.badge-case   { background:rgba(42,90,180,0.1);   color:#2a5ab4; border:1px solid rgba(42,90,180,0.2); }
-.badge-common { background:rgba(45,106,79,0.1);   color:#2d6a4f; border:1px solid rgba(45,106,79,0.2); }
-.badge-admin  { background:rgba(139,38,53,0.08);  color:#8b2635; border:1px solid rgba(139,38,53,0.2); }
-.disclaimer   { background:rgba(184,147,90,0.08); border:1px solid rgba(184,147,90,0.2);
-                border-radius:8px; padding:12px 16px; font-size:12px; color:#6b6b80; line-height:1.6; }
+
+/* ── Use Streamlit's own theme tokens so both light and dark work ── */
+.stApp { background: var(--background-color); }
+
+/* All text inherits Streamlit theme colour — never hardcode dark */
+.stMarkdown, .stMarkdown p, .stMarkdown li,
+.stMarkdown span, .stText { color: var(--text-color) !important; }
+
+/* Expander headers */
+.streamlit-expanderHeader { color: var(--text-color) !important; }
+
+/* Badges — coloured borders/text only, transparent background */
+.badge {
+    display:inline-block; padding:3px 10px; border-radius:20px;
+    font-size:11px; font-weight:600; letter-spacing:0.06em;
+    text-transform:uppercase; margin-right:4px;
+}
+.badge-firm   { background:rgba(184,147,90,0.15); color:#c9a96e; border:1px solid rgba(184,147,90,0.4); }
+.badge-case   { background:rgba(80,130,220,0.15); color:#7aabff; border:1px solid rgba(80,130,220,0.4); }
+.badge-common { background:rgba(60,160,100,0.15); color:#6dcf96; border:1px solid rgba(60,160,100,0.4); }
+.badge-admin  { background:rgba(200,60,80,0.12);  color:#e07080; border:1px solid rgba(200,60,80,0.3); }
+
+/* Disclaimer box — adapts to theme */
+.disclaimer {
+    background: rgba(184,147,90,0.08);
+    border: 1px solid rgba(184,147,90,0.25);
+    border-radius:8px; padding:12px 16px;
+    font-size:12px; line-height:1.6;
+    color: var(--text-color);
+    opacity: 0.8;
+}
+
+/* Inline small/caption text — use opacity instead of fixed colour */
+small { opacity: 0.65; }
+
+/* Card-style containers */
+.card {
+    background: var(--secondary-background-color);
+    border: 1px solid rgba(184,147,90,0.2);
+    border-radius:10px; padding:16px 18px; margin-bottom:10px;
+}
+
+/* Login card */
+.login-card {
+    background: var(--secondary-background-color);
+    border: 1px solid rgba(184,147,90,0.25);
+    border-radius:12px; padding:32px;
+    max-width:420px; margin:60px auto 24px;
+}
+.login-card .wordmark {
+    font-family:'Playfair Display',serif;
+    font-size:28px; font-weight:600;
+    color: var(--text-color);
+    margin-bottom:3px;
+}
+.login-card .tagline {
+    font-size:10px; text-transform:uppercase;
+    letter-spacing:0.1em; opacity:0.5;
+    margin-bottom:28px;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -289,10 +343,9 @@ def pdf_page_images(file_bytes: bytes, max_pages: int = 3) -> list:
 
 # ---- Login ------------------------------------------------------------
 def show_login():
-    st.markdown("""<div style="max-width:420px;margin:60px auto 24px;background:white;
-        border:1px solid rgba(184,147,90,0.2);border-radius:12px;padding:32px">
-        <div style="font-family:'Playfair Display',serif;font-size:28px;font-weight:600;color:#1a1a2e;margin-bottom:3px">AltoLex</div>
-        <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#6b6b80;margin-bottom:28px">by Altovian</div>
+    st.markdown("""<div class="login-card">
+        <div class="wordmark">AltoLex</div>
+        <div class="tagline">by Altovian</div>
         </div>""", unsafe_allow_html=True)
     with st.form("login"):
         st.subheader("Sign in")
@@ -304,7 +357,7 @@ def show_login():
                 st.session_state["ctx"] = result; st.rerun()
             else:
                 st.error("Invalid email or password.")
-    st.markdown('<div class="disclaimer" style="max-width:420px;margin:0 auto">AltoLex provides legal information only - not legal advice.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="disclaimer" style="max-width:420px;margin:0 auto">AltoLex provides legal information only — not legal advice. All outputs must be reviewed by a qualified attorney.</div>', unsafe_allow_html=True)
 
 
 # ---- Sidebar ----------------------------------------------------------
@@ -314,7 +367,7 @@ def show_sidebar():
         st.markdown('<div style="font-family:\'Playfair Display\',serif;font-size:22px;font-weight:600;color:#d4aa7a">AltoLex</div>', unsafe_allow_html=True)
         st.markdown('<div style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:rgba(232,228,220,0.4);margin-bottom:16px">by Altovian</div>', unsafe_allow_html=True)
         st.markdown(f"**{c.get('full_name','')}**")
-        st.markdown(f"<small style='color:#6b6b80'>{c.get('email','')}</small>", unsafe_allow_html=True)
+        st.markdown(f"<small>{c.get('email','')}</small>", unsafe_allow_html=True)
         bc = "badge-admin" if c.get("role") == "admin" else "badge-firm"
         st.markdown(f'<span class="badge {bc}">{c.get("role","").upper()}</span>', unsafe_allow_html=True)
         st.divider()
@@ -695,7 +748,7 @@ elif module == "⚖️ Common Knowledge":
                 badge = "badge-common" if dtype in ("ordinance", "sop") else "badge-case"
                 st.markdown(
                     f'<span class="badge {badge}">{dtype}</span> {d["name"]} '
-                    f'<small style="color:#6b6b80">uploaded {d["created_at"][:10]}</small>',
+                    f'<small>uploaded {d["created_at"][:10]}</small>',
                     unsafe_allow_html=True
                 )
 
