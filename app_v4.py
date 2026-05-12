@@ -31,7 +31,7 @@ try:
 except ImportError:     VOYAGE_OK = False
 
 
-st.set_page_config(page_title="AltoLex", page_icon="=", layout="wide")
+st.set_page_config(page_title="AltoLex", page_icon="⚖️", layout="wide")
 
 st.markdown("""
 <style>
@@ -619,20 +619,20 @@ elif module == "💬 AI Search":
     st.divider()
 
     if not st.session_state.chat_history:
-        with st.chat_message("assistant", avatar="="):
+        with st.chat_message("assistant", avatar="⚖️"):
             st.markdown(f"Ready to search **{sel_ca_title}**. What would you like to know?")
 
     for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"], avatar="=" if msg["role"] == "assistant" else "U"):
+        with st.chat_message(msg["role"], avatar="⚖️" if msg["role"] == "assistant" else "👤"):
             st.markdown(msg["content"])
             if msg.get("chunks_used") is not None:
                 st.caption(f"{msg['chunks_used']} document chunks retrieved")
 
     if user_input := st.chat_input("Ask about these documents..."):
         st.session_state.chat_history.append({"role": "user", "content": user_input})
-        with st.chat_message("user", avatar="U"):
+        with st.chat_message("user", avatar="👤"):
             st.markdown(user_input)
-        with st.chat_message("assistant", avatar="="):
+        with st.chat_message("assistant", avatar="⚖️"):
             with st.spinner("Searching documents..."):
                 history = [{"role": m["role"], "content": m["content"]}
                            for m in st.session_state.chat_history[:-1][-8:]]
