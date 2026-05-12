@@ -21,23 +21,8 @@ from supabase.lib.client_options import ClientOptions
 
 
 def _raw_client() -> Client:
-    import streamlit as st
-
-    url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")
-    key = (
-        os.environ.get("SUPABASE_SERVICE_KEY")
-        or st.secrets.get("SUPABASE_SERVICE_KEY", "")
-        or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")  # common alternative name
-        or st.secrets.get("supabase_service_key", "")       # lowercase variant
-    )
-
-    if not url:
-        raise ValueError("SUPABASE_URL is not set in secrets or environment.")
-    if not key:
-        raise ValueError(
-            "Service key not found. Check Streamlit Secrets — "
-            "the key must be named exactly: SUPABASE_SERVICE_KEY"
-        )
+    url = os.environ.get("SUPABASE_URL") or __import__("streamlit").secrets.get("SUPABASE_URL","")
+    key = os.environ.get("SUPABASE_SERVICE_KEY") or __import__("streamlit").secrets.get("SUPABASE_SERVICE_KEY","")
     return create_client(url, key)
 
 
@@ -99,7 +84,7 @@ class ScopedDB:
     def __init__(self, firm_id: str):
         if not firm_id:
             raise ValueError("ScopedDB requires a firm_id. Never instantiate without one.")
-        self._firm_id = str(firm_id)
+        self._firm_id = firm_id
         self._client  = _raw_client()
 
     def table(self, name: str):

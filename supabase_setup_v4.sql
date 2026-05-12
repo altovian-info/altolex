@@ -177,16 +177,16 @@ $$;
 -- Generate a new hash at: https://bcrypt.online (cost factor 12)
 -- ════════════════════════════════════════════════════════════
 
-INSERT INTO firms (id, name, plan)
-VALUES ('00000000-0000-0000-0000-000000000001', 'Altovian Law', 'pro');
+-- INSERT INTO firms (id, name, plan)
+-- VALUES ('00000000-0000-0000-0000-000000000001', 'Altovian Law', 'pro');
 
-INSERT INTO users (firm_id, email, password_hash, full_name, role)
- VALUES (
-     '00000000-0000-0000-0000-000000000001',
-     'altovian.info@gmail.com',
-     '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj/VgYy6K3Hy',  -- "changeme123"
-     'Admin User',
-     'admin'
+-- INSERT INTO users (firm_id, email, password_hash, full_name, role)
+-- VALUES (
+--     '00000000-0000-0000-0000-000000000001',
+--     'admin@yourfirm.com',
+--     '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj/VgYy6K3Hy',  -- "changeme123"
+--     'Admin User',
+--     'admin'
 -- );
 
 
