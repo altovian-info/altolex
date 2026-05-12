@@ -96,7 +96,38 @@ def show_login():
         st.subheader("Sign in")
         email    = st.text_input("Email address")
         password = st.text_input("Password", type="password")
+        debug    = st.checkbox("Show debug info", value=False)
         if st.form_submit_button("Sign in →", use_container_width=True):
+
+            if debug:
+                # 1. Check secrets
+                try:
+                    url = st.secrets.get("SUPABASE_URL", "NOT SET")
+                    key = st.secrets.get("SUPABASE_SERVICE_KEY", "NOT SET")
+                    st.code(
+                        f"SUPABASE_URL        : {'SET ✅' if url and url!='NOT SET' else 'MISSING ❌'}\n"
+                        f"SUPABASE_SERVICE_KEY: {'SET ✅ ('+key[:12]+'...)' if key and key!='NOT SET' else 'MISSING ❌'}"
+                    )
+                except Exception as e:
+                    st.error(f"Cannot read secrets: {e}")
+
+                # 2. Try DB lookup directly
+                try:
+                    from db import raw_client
+                    import bcrypt as _bcrypt
+                    rc = raw_client()
+                    r  = rc.table("users").select("id,email,is_active,password_hash") \
+                           .eq("email", email.strip().lower()).execute()
+                    if r.data:
+                        u = r.data[0]
+                        st.success(f"User found ✅  is_active={u.get('is_active')}")
+                        match = _bcrypt.checkpw(password.encode(), u["password_hash"].encode())
+                        st.info(f"Password match: {'Yes ✅' if match else 'No ❌ — hash mismatch'}")
+                    else:
+                        st.error("User NOT found ❌ — wrong email or RLS blocking the query")
+                except Exception as e:
+                    st.error(f"DB error: {e}")
+
             result = login(email, password)
             if result:
                 st.session_state["ctx"] = result
