@@ -1,0 +1,7 @@
+[theme]
+# Neutral base — works in both light and dark mode
+# Users can override via Settings > Theme in the app
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
