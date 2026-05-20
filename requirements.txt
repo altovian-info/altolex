@@ -1,4 +1,4 @@
-# AltoLex v4 requirements
+# AltoLex requirements
 anthropic>=0.25.0
 streamlit>=1.32.0
 supabase>=2.3.0
@@ -7,6 +7,7 @@ bcrypt>=4.1.0
 PyPDF2>=3.0.0
 PyMuPDF>=1.23.0
 python-docx>=1.1.0
+reportlab>=4.0.0
 python-dotenv>=1.0.0
 fastapi>=0.110.0
 uvicorn>=0.29.0
