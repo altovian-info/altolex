@@ -10,8 +10,9 @@ Full implementation:
 
 import streamlit as st
 import anthropic
-import os, io, base64, hashlib
+import os, io, base64, hashlib, json, re
 from pathlib import Path
+from datetime import date
 from auth import (login, logout, validate_session,
                   create_user, update_user, deactivate_user,
                   reactivate_user, list_users, log_action)
@@ -21,8 +22,18 @@ try:
     import fitz;        PYMUPDF_OK = True
 except ImportError:     PYMUPDF_OK = False
 try:
-    from docx import Document as DocxDocument; DOCX_OK = True
+    from docx import Document as DocxDocument
+    from docx.shared import Pt, RGBColor, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    DOCX_OK = True
 except ImportError:     DOCX_OK = False
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    REPORTLAB_OK = True
+except ImportError:     REPORTLAB_OK = False
 try:
     import PyPDF2;      PYPDF2_OK = True
 except ImportError:     PYPDF2_OK = False
@@ -269,8 +280,12 @@ def embed_and_store(file_bytes: bytes, filename: str, firm_id: str, case_id: str
         r = vo.embed(chunks[i:i+64], model="voyage-law-2", input_type="document")
         vectors.extend(r.embeddings)
 
+    # Upload to Supabase Storage for later preview retrieval
+    storage_path = storage_upload(file_bytes, firm_id, case_id, filename)
+
     rows = [{"firm_id": firm_id, "case_id": case_id, "content": chunk, "embedding": vector,
-             "metadata": {"source": filename, "doc_type": doc_type_tag(filename), "chunk_idx": idx},
+             "metadata": {"source": filename, "doc_type": doc_type_tag(filename),
+                          "chunk_idx": idx, "storage_path": storage_path},
              "file_hash": fhash}
             for idx, (chunk, vector) in enumerate(zip(chunks, vectors))]
 
@@ -278,7 +293,371 @@ def embed_and_store(file_bytes: bytes, filename: str, firm_id: str, case_id: str
     for i in range(0, len(rows), 50):
         rc.table("documents").insert(rows[i:i+50]).execute()
 
-    return {"skipped": False, "chunks": len(chunks), "method": method}
+    return {"skipped": False, "chunks": len(chunks), "method": method, "storage_path": storage_path}
+
+
+
+
+# ---- Supabase Storage helpers ------------------------------------------
+STORAGE_BUCKET = "altolex-documents"
+
+def storage_upload(file_bytes: bytes, firm_id: str, case_id: str, filename: str) -> str:
+    """Upload file bytes to Supabase Storage. Returns storage path."""
+    import mimetypes
+    rc = raw_client()
+    safe_name = re.sub(r"[^\w.\-]", "_", filename)
+    folder = f"{firm_id}/{case_id or 'common'}"
+    path   = f"{folder}/{safe_name}"
+    mime   = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    try:
+        rc.storage.from_(STORAGE_BUCKET).upload(
+            path=path,
+            file=file_bytes,
+            file_options={"content-type": mime, "upsert": "true"}
+        )
+    except Exception as e:
+        # If bucket doesn't exist yet, create it then retry
+        if "not found" in str(e).lower() or "does not exist" in str(e).lower():
+            try:
+                rc.storage.create_bucket(STORAGE_BUCKET, options={"public": False})
+                rc.storage.from_(STORAGE_BUCKET).upload(
+                    path=path, file=file_bytes,
+                    file_options={"content-type": mime, "upsert": "true"}
+                )
+            except Exception:
+                return ""
+        else:
+            return ""
+    return path
+
+def storage_download(storage_path: str) -> bytes | None:
+    """Download file bytes from Supabase Storage."""
+    try:
+        rc  = raw_client()
+        res = rc.storage.from_(STORAGE_BUCKET).download(storage_path)
+        return res
+    except Exception:
+        return None
+
+def get_stored_docs_with_path(case_id: str = None, firm_wide: bool = False) -> list:
+    """List unique docs with their storage paths for preview."""
+    if firm_wide:
+        rows = raw_client().table("documents") \
+                .select("metadata,file_hash,created_at") \
+                .eq("firm_id", ctx()["firm_id"]).is_("case_id", "null").execute().data or []
+    else:
+        rows = sdb().table("documents").select("metadata,file_hash,created_at") \
+                    .eq("case_id", case_id).execute().data or []
+    seen = set(); result = []
+    for row in rows:
+        h = row.get("file_hash", "")
+        if h not in seen:
+            seen.add(h)
+            meta = row.get("metadata", {})
+            result.append({
+                "name":         meta.get("source", "unknown"),
+                "file_hash":    h,
+                "storage_path": meta.get("storage_path", ""),
+                "created_at":   row.get("created_at", ""),
+                "doc_type":     meta.get("doc_type", "general"),
+            })
+    return result
+
+
+# ---- PDF viewer HTML component -----------------------------------------
+def render_pdf_viewer(file_bytes: bytes, filename: str, height: int = 600):
+    """Render a PDF inline using PDF.js via Streamlit HTML component."""
+    if not file_bytes:
+        st.warning("Could not load document.")
+        return
+    b64 = base64.b64encode(file_bytes).decode()
+    html = f"""
+    <div id="pdf-outer" style="border:1px solid var(--border-color,#ddd);border-radius:8px;overflow:hidden;background:#2a2a2a;">
+
+      <!-- Toolbar -->
+      <div style="display:flex;align-items:center;gap:8px;padding:8px 14px;
+                  background:#1a1a2e;color:#d4aa7a;font-size:13px;font-family:sans-serif;">
+        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{filename}</span>
+        <button onclick="changePage(-1)" style="background:rgba(255,255,255,0.1);border:none;color:#d4aa7a;
+          padding:4px 10px;border-radius:5px;cursor:pointer;font-size:13px">&#8249;</button>
+        <span id="page-info" style="font-size:12px;white-space:nowrap">Page 1</span>
+        <button onclick="changePage(1)"  style="background:rgba(255,255,255,0.1);border:none;color:#d4aa7a;
+          padding:4px 10px;border-radius:5px;cursor:pointer;font-size:13px">&#8250;</button>
+        <button onclick="zoomIn()"  style="background:rgba(255,255,255,0.1);border:none;color:#d4aa7a;
+          padding:4px 8px;border-radius:5px;cursor:pointer">+</button>
+        <button onclick="zoomOut()" style="background:rgba(255,255,255,0.1);border:none;color:#d4aa7a;
+          padding:4px 8px;border-radius:5px;cursor:pointer">-</button>
+        <button onclick="printPDF()" style="background:rgba(184,147,90,0.2);border:1px solid rgba(184,147,90,0.4);
+          color:#d4aa7a;padding:4px 12px;border-radius:5px;cursor:pointer;font-size:12px">Print</button>
+      </div>
+
+      <!-- Canvas -->
+      <div style="overflow:auto;max-height:{height}px;display:flex;justify-content:center;padding:16px;">
+        <canvas id="pdf-canvas" style="box-shadow:0 4px 20px rgba(0,0,0,0.5);border-radius:3px;"></canvas>
+      </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+      const pdfData  = atob('{b64}');
+      const pdfBytes = new Uint8Array(pdfData.length);
+      for (let i=0; i<pdfData.length; i++) pdfBytes[i] = pdfData.charCodeAt(i);
+
+      let pdfDoc=null, curPage=1, scale=1.4;
+
+      pdfjsLib.getDocument({{data:pdfBytes}}).promise.then(doc => {{
+        pdfDoc = doc;
+        renderPage(1);
+      }});
+
+      function renderPage(n) {{
+        pdfDoc.getPage(n).then(page => {{
+          const vp  = page.getViewport({{scale}});
+          const canvas = document.getElementById('pdf-canvas');
+          const ctx  = canvas.getContext('2d');
+          canvas.width  = vp.width;
+          canvas.height = vp.height;
+          page.render({{canvasContext:ctx, viewport:vp}});
+          document.getElementById('page-info').textContent =
+            'Page ' + curPage + ' of ' + pdfDoc.numPages;
+        }});
+      }}
+
+      function changePage(d) {{
+        const n = curPage + d;
+        if (!pdfDoc || n < 1 || n > pdfDoc.numPages) return;
+        curPage = n; renderPage(curPage);
+      }}
+
+      function zoomIn()  {{ scale = Math.min(3.0, scale+0.25); if(pdfDoc) renderPage(curPage); }}
+      function zoomOut() {{ scale = Math.max(0.5, scale-0.25); if(pdfDoc) renderPage(curPage); }}
+
+      function printPDF() {{
+        const win = window.open('');
+        win.document.write('<html><body style="margin:0">');
+        win.document.write('<canvas id="pc"></canvas>');
+        win.document.write('</body></html>');
+        win.document.close();
+        const allPages = async () => {{
+          for (let i=1; i<=pdfDoc.numPages; i++) {{
+            const pg = await pdfDoc.getPage(i);
+            const vp = pg.getViewport({{scale:1.5}});
+            const c  = win.document.getElementById('pc');
+            c.width=vp.width; c.height=vp.height;
+            await pg.render({{canvasContext:c.getContext('2d'),viewport:vp}}).promise;
+          }}
+          win.print();
+        }};
+        allPages();
+      }}
+    </script>
+    """
+    st.components.v1.html(html, height=height + 60, scrolling=False)
+
+
+# ---- Contract templates -------------------------------------------------
+CONTRACT_TEMPLATES = {
+    "Non-Disclosure Agreement (NDA)": {
+        "description": "Mutual or one-way confidentiality agreement between two parties.",
+        "fields": [
+            {"key": "disclosing_party",   "label": "Disclosing party name",        "type": "text"},
+            {"key": "receiving_party",    "label": "Receiving party name",          "type": "text"},
+            {"key": "purpose",            "label": "Purpose of disclosure",         "type": "text",
+             "placeholder": "e.g. evaluating a potential business partnership"},
+            {"key": "duration_years",     "label": "Confidentiality period (years)","type": "number", "default": 2},
+            {"key": "governing_law",      "label": "Governing law / jurisdiction",  "type": "text",
+             "default": "Sri Lanka"},
+            {"key": "date",               "label": "Agreement date",                "type": "date"},
+        ],
+    },
+    "Employment Contract": {
+        "description": "Standard contract of employment for a permanent employee.",
+        "fields": [
+            {"key": "employer_name",      "label": "Employer name",                 "type": "text"},
+            {"key": "employer_address",   "label": "Employer address",              "type": "text"},
+            {"key": "employee_name",      "label": "Employee full name",            "type": "text"},
+            {"key": "employee_nic",       "label": "Employee NIC number",           "type": "text"},
+            {"key": "position",           "label": "Job title / position",          "type": "text"},
+            {"key": "start_date",         "label": "Start date",                    "type": "date"},
+            {"key": "basic_salary",       "label": "Basic salary (LKR/month)",      "type": "text"},
+            {"key": "notice_period_months","label": "Notice period (months)",       "type": "number", "default": 3},
+            {"key": "probation_months",   "label": "Probation period (months)",     "type": "number", "default": 6},
+            {"key": "working_hours",      "label": "Working hours",                 "type": "text",
+             "default": "8:30 AM to 5:30 PM, Monday to Friday"},
+        ],
+    },
+    "Tenancy Agreement": {
+        "description": "Residential or commercial lease agreement.",
+        "fields": [
+            {"key": "landlord_name",      "label": "Landlord full name",            "type": "text"},
+            {"key": "tenant_name",        "label": "Tenant full name",              "type": "text"},
+            {"key": "property_address",   "label": "Property address",              "type": "text"},
+            {"key": "monthly_rent",       "label": "Monthly rent (LKR)",            "type": "text"},
+            {"key": "deposit",            "label": "Security deposit (LKR)",        "type": "text"},
+            {"key": "lease_start",        "label": "Lease start date",              "type": "date"},
+            {"key": "lease_months",       "label": "Lease duration (months)",       "type": "number", "default": 12},
+            {"key": "notice_days",        "label": "Notice period (days)",          "type": "number", "default": 30},
+            {"key": "use",                "label": "Permitted use",                 "type": "text",
+             "default": "residential purposes only"},
+        ],
+    },
+    "Power of Attorney": {
+        "description": "General or specific power of attorney under Sri Lankan law.",
+        "fields": [
+            {"key": "donor_name",         "label": "Donor (grantor) full name",     "type": "text"},
+            {"key": "donor_nic",          "label": "Donor NIC",                     "type": "text"},
+            {"key": "donor_address",      "label": "Donor address",                 "type": "text"},
+            {"key": "attorney_name",      "label": "Attorney-in-fact full name",    "type": "text"},
+            {"key": "attorney_nic",       "label": "Attorney-in-fact NIC",          "type": "text"},
+            {"key": "powers",             "label": "Powers granted",                "type": "textarea",
+             "placeholder": "e.g. to sell, transfer and convey the property at No. 42 Galle Road, Colombo"},
+            {"key": "date",               "label": "Date of execution",             "type": "date"},
+        ],
+    },
+    "Statutory Declaration": {
+        "description": "Formal declaration of facts made under oath.",
+        "fields": [
+            {"key": "declarant_name",     "label": "Declarant full name",           "type": "text"},
+            {"key": "declarant_nic",      "label": "Declarant NIC",                 "type": "text"},
+            {"key": "declarant_address",  "label": "Declarant address",             "type": "text"},
+            {"key": "declaration_facts",  "label": "Facts being declared",          "type": "textarea",
+             "placeholder": "State the facts to be declared..."},
+            {"key": "purpose",            "label": "Purpose of declaration",        "type": "text"},
+            {"key": "date",               "label": "Date",                          "type": "date"},
+        ],
+    },
+    "Service Agreement": {
+        "description": "Agreement for professional or consulting services.",
+        "fields": [
+            {"key": "client_name",        "label": "Client name",                   "type": "text"},
+            {"key": "provider_name",      "label": "Service provider name",         "type": "text"},
+            {"key": "services",           "label": "Description of services",       "type": "textarea",
+             "placeholder": "Describe the services to be provided..."},
+            {"key": "fee",                "label": "Fee / payment terms",           "type": "text",
+             "placeholder": "e.g. LKR 50,000 per month, payable on the 1st"},
+            {"key": "start_date",         "label": "Start date",                    "type": "date"},
+            {"key": "duration",           "label": "Duration",                      "type": "text",
+             "default": "12 months"},
+            {"key": "notice_days",        "label": "Termination notice (days)",     "type": "number", "default": 30},
+            {"key": "governing_law",      "label": "Governing law",                 "type": "text",
+             "default": "Sri Lanka"},
+        ],
+    },
+}
+
+
+def draft_contract_with_ai(template_name: str, variables: dict, firm_knowledge: str = "") -> str:
+    """Call Claude to draft a full contract from template name and variables."""
+    vars_text = "\n".join(f"  {k}: {v}" for k, v in variables.items() if v)
+    prompt = f"""Draft a complete, professional {template_name} under Sri Lankan law.
+
+Use the following details provided by the attorney:
+{vars_text}
+
+Requirements:
+- Use formal legal language appropriate for Sri Lanka
+- Include all standard clauses expected in a {template_name}
+- Reference applicable Sri Lankan statutes where relevant
+- Structure with clear numbered clauses and sub-clauses
+- Include signature blocks for all parties at the end
+- Mark any clause that needs attorney review with [REVIEW]
+- Do NOT use placeholder text like [INSERT] — use the provided details throughout
+- Today's date is {date.today().strftime("%d %B %Y")} if no date was specified
+
+{("The firm's knowledge base contains the following relevant reference:\n" + firm_knowledge) if firm_knowledge else ""}
+
+Output the complete contract text only. No preamble or commentary."""
+
+    resp = get_anthropic().messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=3000,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return resp.content[0].text
+
+
+def export_contract_docx(contract_text: str, title: str) -> bytes:
+    """Convert contract text to a properly formatted DOCX."""
+    if not DOCX_OK:
+        return None
+    doc = DocxDocument()
+
+    # Page margins
+    for section in doc.sections:
+        section.top_margin    = Inches(1)
+        section.bottom_margin = Inches(1)
+        section.left_margin   = Inches(1.2)
+        section.right_margin  = Inches(1.2)
+
+    # Title
+    title_para = doc.add_paragraph()
+    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title_para.add_run(title.upper())
+    run.bold = True
+    run.font.size = Pt(14)
+
+    doc.add_paragraph()
+
+    # Body — parse line by line
+    for line in contract_text.split("\n"):
+        line = line.strip()
+        if not line:
+            doc.add_paragraph()
+            continue
+        para = doc.add_paragraph()
+        # Detect review flags
+        if "[REVIEW]" in line:
+            line = line.replace("[REVIEW]", "")
+            run = para.add_run("[REVIEW] " + line)
+            run.font.color.rgb = RGBColor(0x8B, 0x26, 0x35)
+            run.bold = True
+        # Numbered clause heading
+        elif re.match(r"^\d+\.\s+[A-Z]", line):
+            run = para.add_run(line)
+            run.bold = True
+            run.font.size = Pt(10.5)
+        else:
+            run = para.add_run(line)
+            run.font.size = Pt(10)
+        para.paragraph_format.space_after = Pt(4)
+        para.paragraph_format.line_spacing = Pt(14)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def export_contract_pdf(contract_text: str, title: str) -> bytes:
+    """Convert contract text to PDF using reportlab."""
+    if not REPORTLAB_OK:
+        return None
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+          leftMargin=2.5*cm, rightMargin=2.5*cm,
+          topMargin=2.5*cm, bottomMargin=2.5*cm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("T", parent=styles["Title"],
+        fontSize=13, spaceAfter=12, alignment=1)
+    body_style  = ParagraphStyle("B", parent=styles["Normal"],
+        fontSize=9.5, leading=14, spaceAfter=4)
+    flag_style  = ParagraphStyle("F", parent=styles["Normal"],
+        fontSize=9.5, leading=14, spaceAfter=4, textColor=(0.55,0.15,0.21))
+
+    story = [Paragraph(title.upper(), title_style), Spacer(1, 0.3*cm)]
+    for line in contract_text.split("\n"):
+        line = line.strip()
+        if not line:
+            story.append(Spacer(1, 0.15*cm))
+        elif "[REVIEW]" in line:
+            story.append(Paragraph("[REVIEW] " + line.replace("[REVIEW]","").strip(), flag_style))
+        else:
+            story.append(Paragraph(line, body_style))
+    doc.build(story)
+    return buf.getvalue()
 
 
 # ---- RAG Q&A -----------------------------------------------------------
@@ -373,7 +752,8 @@ def show_sidebar():
         st.divider()
 
         modules = ["📋 Client Intake", "👥 Clients & Cases",
-                   "📁 Document Library", "💬 AI Search", "⚖️ Common Knowledge"]
+                   "📁 Document Library", "💬 AI Search", "⚖️ Common Knowledge",
+                   "✍️ Draft Contract"]
         if is_admin():
             modules.append("⚙ Admin")
 
@@ -384,6 +764,7 @@ def show_sidebar():
         st.markdown(f"{'OK' if PYMUPDF_OK else 'X'} Scanned PDFs (OCR)")
         st.markdown(f"{'OK' if DOCX_OK else 'X'} Word docs")
         st.markdown(f"{'OK' if VOYAGE_OK else 'X'} voyage-law-2")
+        st.markdown(f"{'OK' if REPORTLAB_OK else 'X'} PDF export")
         st.divider()
         if st.button("Sign out"):
             logout(c.get("token")); st.session_state.clear(); st.rerun()
@@ -576,7 +957,6 @@ elif module == "👥 Clients & Cases":
 # ======================================================================
 elif module == "📁 Document Library":
     st.title("Document Library")
-    st.markdown("Upload documents for a specific client case. Files are embedded and stored for AI search.")
 
     clients = get_clients()
     if not clients:
@@ -595,45 +975,91 @@ elif module == "📁 Document Library":
         case_map = {ca["title"]: ca for ca in cases}
         sel_ca = case_map[st.selectbox("Case", list(case_map.keys()))]
 
-    st.divider()
+    tab_docs, tab_upload = st.tabs(["📂 Documents", "⬆ Upload"])
 
-    # Show existing documents
-    existing = get_stored_docs(case_id=sel_ca["id"])
-    if existing:
-        st.markdown(f"**{len(existing)} document(s) stored for this case:**")
-        for d in existing:
-            st.markdown(f"- {d['name']}  _(uploaded {d['created_at'][:10]})_")
-        st.divider()
+    with tab_docs:
+        existing = get_stored_docs_with_path(case_id=sel_ca["id"])
+        if not existing:
+            st.info("No documents stored for this case yet. Use the Upload tab.")
+        else:
+            st.markdown(f"**{len(existing)} document(s)** for *{sel_ca['title']}*")
+            st.divider()
 
-    # Upload
-    st.subheader("Upload new documents")
-    uploaded_files = st.file_uploader(
-        "Choose files", type=["pdf", "docx", "doc"],
-        accept_multiple_files=True, label_visibility="collapsed"
-    )
+            # Preview selector
+            doc_names   = [d["name"] for d in existing]
+            preview_sel = st.selectbox("Select document to preview", doc_names,
+                                       key="doc_preview_sel")
+            sel_doc     = next((d for d in existing if d["name"] == preview_sel), None)
 
-    if uploaded_files:
-        label = f"Embed & Store {len(uploaded_files)} file(s) for '{sel_ca['title']}'"
-        if st.button(label, type="primary", disabled=is_readonly()):
-            for uf in uploaded_files:
-                with st.spinner(f"Processing {uf.name}..."):
-                    file_bytes = uf.read()
-                    if uf.name.lower().endswith(".pdf") and PYMUPDF_OK:
-                        imgs = pdf_page_images(file_bytes, max_pages=1)
-                        if imgs:
-                            st.image(base64.b64decode(imgs[0]), width=260, caption=uf.name)
-                    result = embed_and_store(file_bytes, uf.name, c["firm_id"], sel_ca["id"])
+            if sel_doc:
+                col_meta, col_dl = st.columns([3, 1])
+                with col_meta:
+                    dtype = sel_doc.get("doc_type", "general")
+                    badge = "badge-common" if dtype == "ordinance" else "badge-case"
+                    st.markdown(
+                        f'<span class="badge {badge}">{dtype}</span> '
+                        f'<small>uploaded {sel_doc["created_at"][:10]}</small>',
+                        unsafe_allow_html=True
+                    )
 
-                if result.get("skipped"):
-                    st.warning(f"Skipped {uf.name} - already stored.")
-                elif result.get("chunks", 0) > 0:
-                    st.success(f"Stored {uf.name} - {result['chunks']} chunks ({result['method']})")
-                    log_action(c["firm_id"], c["user_id"], "ingest",
-                               {"filename": uf.name, "case_id": sel_ca["id"], "chunks": result["chunks"]})
+                # Load bytes from Storage
+                if sel_doc.get("storage_path"):
+                    with st.spinner("Loading document..."):
+                        doc_bytes = storage_download(sel_doc["storage_path"])
+                    if doc_bytes:
+                        with col_dl:
+                            st.download_button(
+                                "⬇ Download",
+                                data=doc_bytes,
+                                file_name=sel_doc["name"],
+                                mime="application/octet-stream",
+                                use_container_width=True,
+                            )
+                        st.divider()
+                        if sel_doc["name"].lower().endswith(".pdf"):
+                            render_pdf_viewer(doc_bytes, sel_doc["name"], height=580)
+                        else:
+                            # DOCX / other — show extracted text
+                            text, _ = extract_text(doc_bytes, sel_doc["name"])
+                            st.text_area("Document content", value=text[:5000] +
+                                ("..." if len(text) > 5000 else ""),
+                                height=480, disabled=True, label_visibility="collapsed")
+                    else:
+                        st.warning("Document file not found in storage. "
+                                   "Re-upload to enable preview.")
                 else:
-                    err = result.get("error", "")
-                    st.error(f"Failed {uf.name} - could not extract text. {err}")
-            st.rerun()
+                    st.info("Preview not available — document was uploaded before "
+                            "storage was enabled. Re-upload to enable preview.")
+
+    with tab_upload:
+        st.markdown("Files are embedded for AI search and stored for preview.")
+        uploaded_files = st.file_uploader(
+            "Choose files", type=["pdf", "docx", "doc"],
+            accept_multiple_files=True, label_visibility="collapsed"
+        )
+        if uploaded_files:
+            label = f"Embed & Store {len(uploaded_files)} file(s)"
+            if st.button(label, type="primary", disabled=is_readonly()):
+                for uf in uploaded_files:
+                    with st.spinner(f"Processing {uf.name}..."):
+                        file_bytes = uf.read()
+                        if uf.name.lower().endswith(".pdf") and PYMUPDF_OK:
+                            imgs = pdf_page_images(file_bytes, max_pages=1)
+                            if imgs:
+                                st.image(base64.b64decode(imgs[0]),
+                                         width=240, caption=uf.name)
+                        result = embed_and_store(file_bytes, uf.name,
+                                                 c["firm_id"], sel_ca["id"])
+                    if result.get("skipped"):
+                        st.warning(f"Skipped — {uf.name} already stored.")
+                    elif result.get("chunks", 0) > 0:
+                        st.success(f"Stored {uf.name} — {result['chunks']} chunks "
+                                   f"({result['method']})")
+                        log_action(c["firm_id"], c["user_id"], "ingest",
+                                   {"filename": uf.name, "case_id": sel_ca["id"]})
+                    else:
+                        st.error(f"Failed {uf.name} — {result.get('error','')}")
+                st.rerun()
 
 
 # ======================================================================
@@ -691,8 +1117,14 @@ elif module == "💬 AI Search":
                            for m in st.session_state.chat_history[:-1][-8:]]
                 answer, n = rag_ask(user_input, sel_case_id, history)
             st.markdown(answer)
-            st.caption(f"{n} document chunks retrieved")
-            st.session_state.chat_history.append({"role": "assistant", "content": answer, "chunks_used": n})
+            if n > 0:
+                st.caption(f"{n} document chunks retrieved")
+                # Offer source preview inline
+                if "source_chunks" not in st.session_state:
+                    st.session_state["source_chunks"] = []
+            st.session_state.chat_history.append({
+                "role": "assistant", "content": answer, "chunks_used": n
+            })
 
     if st.session_state.chat_history:
         if st.button("Clear conversation"):
@@ -751,6 +1183,178 @@ elif module == "⚖️ Common Knowledge":
                     f'<small>uploaded {d["created_at"][:10]}</small>',
                     unsafe_allow_html=True
                 )
+
+
+# ======================================================================
+# MODULE: DRAFT CONTRACT
+# ======================================================================
+elif module == "✍️ Draft Contract":
+    if is_readonly():
+        st.warning("Readonly role cannot draft contracts."); st.stop()
+
+    st.title("✍️ Draft Contract")
+    st.markdown("Select a template, fill in the details, and let AltoLex generate a complete contract ready for attorney review.")
+
+    # Template selector
+    tmpl_name = st.selectbox(
+        "Contract type",
+        list(CONTRACT_TEMPLATES.keys()),
+        key="tmpl_sel"
+    )
+    tmpl = CONTRACT_TEMPLATES[tmpl_name]
+    st.caption(tmpl["description"])
+    st.divider()
+
+    # Optional: link to a client/case
+    clients = get_clients()
+    link_col1, link_col2, link_col3 = st.columns([2, 2, 1])
+    with link_col1:
+        link_client = st.selectbox("Link to client (optional)",
+            ["— none —"] + [cl["full_name"] for cl in clients], key="draft_cl")
+    sel_draft_case = None
+    with link_col2:
+        if link_client != "— none —":
+            cl_obj = next((x for x in clients if x["full_name"] == link_client), None)
+            if cl_obj:
+                cl_cases = get_cases(cl_obj["id"])
+                if cl_cases:
+                    link_case = st.selectbox("Case", [ca["title"] for ca in cl_cases],
+                                             key="draft_ca")
+                    sel_draft_case = next((ca for ca in cl_cases
+                                           if ca["title"] == link_case), None)
+
+    st.divider()
+
+    # Variable fields
+    st.subheader("Contract details")
+    variables = {}
+    # Render fields in 2-column grid
+    field_pairs = [tmpl["fields"][i:i+2] for i in range(0, len(tmpl["fields"]), 2)]
+    for pair in field_pairs:
+        cols = st.columns(len(pair))
+        for col, field in zip(cols, pair):
+            with col:
+                key      = field["key"]
+                label    = field["label"]
+                ftype    = field.get("type", "text")
+                default  = field.get("default", "")
+                placeholder = field.get("placeholder", "")
+                if ftype == "text":
+                    variables[key] = st.text_input(label, value=str(default),
+                                                   placeholder=placeholder,
+                                                   key=f"f_{tmpl_name}_{key}")
+                elif ftype == "number":
+                    variables[key] = st.number_input(label, value=int(default) if default else 1,
+                                                     min_value=0, key=f"f_{tmpl_name}_{key}")
+                elif ftype == "date":
+                    variables[key] = str(st.date_input(label,
+                                         value=date.today(),
+                                         key=f"f_{tmpl_name}_{key}"))
+                elif ftype == "textarea":
+                    variables[key] = st.text_area(label, value=str(default),
+                                                  placeholder=placeholder, height=80,
+                                                  key=f"f_{tmpl_name}_{key}")
+
+    st.divider()
+
+    # Draft button
+    if "drafted_contract" not in st.session_state:
+        st.session_state["drafted_contract"] = ""
+    if "drafted_title"    not in st.session_state:
+        st.session_state["drafted_title"]    = ""
+
+    if st.button("✦ Generate Contract Draft", type="primary"):
+        filled = {k: v for k, v in variables.items() if str(v).strip()}
+        if len(filled) < 2:
+            st.warning("Please fill in at least the main party names before drafting.")
+        else:
+            with st.spinner("Drafting contract..."):
+                draft = draft_contract_with_ai(tmpl_name, filled)
+                st.session_state["drafted_contract"] = draft
+                st.session_state["drafted_title"]    = tmpl_name
+                log_action(c["firm_id"], c["user_id"], "contract_draft",
+                           {"template": tmpl_name,
+                            "case_id": sel_draft_case["id"] if sel_draft_case else None})
+            st.success("Draft generated. Review carefully before use.")
+
+    # Show draft
+    if st.session_state.get("drafted_contract"):
+        draft_text  = st.session_state["drafted_contract"]
+        draft_title = st.session_state["drafted_title"]
+
+        tab_preview, tab_edit, tab_export = st.tabs(["👁 Preview", "✏️ Edit", "⬇ Export"])
+
+        with tab_preview:
+            st.caption("Clauses marked [REVIEW] require specific attorney attention.")
+            # Colour-code [REVIEW] flags
+            lines = draft_text.split("\n")
+            for line in lines:
+                if "[REVIEW]" in line:
+                    st.markdown(
+                        f'<div style="background:rgba(139,38,53,0.06);border-left:3px solid '
+                        f'rgba(139,38,53,0.4);padding:6px 10px;border-radius:0 6px 6px 0;'
+                        f'margin:2px 0;font-size:13px;color:var(--text-color)">'
+                        f'⚠️ {line.replace("[REVIEW]","").strip()}</div>',
+                        unsafe_allow_html=True
+                    )
+                elif line.strip():
+                    st.markdown(line)
+                else:
+                    st.markdown("")
+
+        with tab_edit:
+            st.caption("Edit the draft directly. Changes are saved automatically.")
+            edited = st.text_area("Contract text", value=draft_text,
+                                  height=600, label_visibility="collapsed",
+                                  key="contract_edit_area")
+            if edited != draft_text:
+                st.session_state["drafted_contract"] = edited
+                draft_text = edited
+
+        with tab_export:
+            st.markdown("Download the contract in your preferred format.")
+            st.caption("⚠️ Always review the AI-generated draft before sending to any party.")
+            ecol1, ecol2 = st.columns(2)
+            with ecol1:
+                docx_bytes = export_contract_docx(draft_text, draft_title)
+                if docx_bytes:
+                    st.download_button(
+                        "⬇ Download as Word (.docx)",
+                        data=docx_bytes,
+                        file_name=f"{draft_title.replace(' ','_')}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True
+                    )
+                else:
+                    st.warning("python-docx not installed — DOCX export unavailable.")
+            with ecol2:
+                pdf_bytes = export_contract_pdf(draft_text, draft_title)
+                if pdf_bytes:
+                    st.download_button(
+                        "⬇ Download as PDF",
+                        data=pdf_bytes,
+                        file_name=f"{draft_title.replace(' ','_')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+                else:
+                    st.warning("reportlab not installed — PDF export unavailable.")
+
+            # Optionally save to case documents
+            if sel_draft_case and (docx_bytes or pdf_bytes):
+                st.divider()
+                if st.button("💾 Save draft to case documents"):
+                    save_bytes = docx_bytes or pdf_bytes
+                    save_name  = f"{draft_title.replace(' ','_')}_DRAFT.{'docx' if docx_bytes else 'pdf'}"
+                    result = embed_and_store(save_bytes, save_name,
+                                            c["firm_id"], sel_draft_case["id"])
+                    if result.get("skipped"):
+                        st.info("Draft already saved to this case.")
+                    elif result.get("chunks", 0) > 0:
+                        st.success(f"Draft saved to case '{sel_draft_case['title']}' "
+                                   f"and indexed for AI search.")
+                    else:
+                        st.error("Could not save draft to case.")
 
 
 # ======================================================================
